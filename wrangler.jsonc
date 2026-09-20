@@ -1,7 +1,7 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "voiceledger-ocr",
-  "main": "src/worker.js",
+  "main": "worker.js",
   "compatibility_date": "2026-09-20",
   "workers_dev": true,
   "keep_vars": true,
