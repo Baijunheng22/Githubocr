@@ -31,3 +31,4 @@ Cloudflare 从 GitHub 自动读取这里的代码，并部署到现有的 `voice
 - `"provider": "火山引擎通用文字识别"`
 - `"model": "OCRNormal"`
 - `"configured": true`
+wahhty
