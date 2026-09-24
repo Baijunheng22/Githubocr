@@ -1,12 +1,7 @@
 {
   "name": "voiceledger-ocr-worker",
-  "version": "0.6.0",
   "private": true,
-  "type": "module",
-  "scripts": {
-    "deploy": "wrangler deploy"
-  },
-  "devDependencies": {
-    "wrangler": "^4.0.0"
-  }
+  "version": "0.9.0-beta",
+  "scripts": {"deploy": "wrangler deploy"},
+  "devDependencies": {"wrangler": "^4.0.0"}
 }

@@ -194,6 +194,89 @@ function parseOcrLines(lines, books=[]) {
   return records;
 }
 
+
+function median(values){const a=values.filter(Number.isFinite).sort((x,y)=>x-y);if(!a.length)return 16;const m=Math.floor(a.length/2);return a.length%2?a[m]:(a[m-1]+a[m])/2;}
+function cleanNumber(text){const m=String(text||'').replace(/,/g,'').match(/-?\d+(?:\.\d+)?/);return m?Number(m[0]):NaN;}
+function cleanDate(text){const m=String(text||'').match(/20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}/);return m?m[0].replace(/[/.]/g,'-').split('-').map((x,i)=>i?String(Number(x)).padStart(2,'0'):x).join('-'):'';}
+function cleanDateRange(text){const all=String(text||'').match(/20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}/g)||[];if(!all.length)return '';const ds=all.slice(0,2).map(x=>x.replace(/[/.]/g,'-').split('-').map((v,i)=>i?String(Number(v)).padStart(2,'0'):v).join('-'));return ds.length>1?`${ds[0]} ~ ${ds[1]}`:ds[0];}
+function guaguaHeaderKey(text){const t=normText(text).replace(/\s+/g,'');const pairs=[['serial','序号'],['income_source','收入来源'],['book_name','书籍名称'],['work_type','工作类型'],['workload_hours','工作量'],['rate','单价'],['amount','金额'],['settlement_method','结算方式'],['settlement_range','结算范围'],['settlement_date','结算日期']];for(const [k,label] of pairs)if(t.includes(label))return k;return '';}
+function clusterByRow(lines,threshold){
+  const sorted=lines.slice().sort((a,b)=>a.cy-b.cy||a.rect.x-b.rect.x),rows=[];
+  for(const line of sorted){let row=rows[rows.length-1];if(!row||Math.abs(line.cy-row.cy)>threshold){row={cy:line.cy,items:[line]};rows.push(row);}else{row.items.push(line);row.cy=row.items.reduce((a,x)=>a+x.cy,0)/row.items.length;}}
+  return rows.map(r=>({...r,items:r.items.sort((a,b)=>a.rect.x-b.rect.x)}));
+}
+function parseGuaguaJoinedText(text){
+  const t=String(text||'').replace(/[：]/g,':').replace(/[～—–−]/g,'~').replace(/\s+/g,' ').trim();
+  if(!t)return null;
+  const dateMatches=t.match(/20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}/g)||[];
+  if(dateMatches.length<1)return null;
+  const methodMatch=t.match(/自动月结|手动结算|自动结算|月结|结算/);
+  if(!methodMatch)return null;
+  const method=methodMatch[0],methodIndex=t.indexOf(method);
+  const before=t.slice(0,methodIndex).trim(),after=t.slice(methodIndex+method.length).trim();
+  const tokens=before.split(' ').filter(Boolean);
+  if(tokens.length<7)return null;
+  const serial=Number(tokens[0]);if(!Number.isFinite(serial))return null;
+  // 从结算方式前向前取 金额 / 单价 / 工作量，避免书名中的数字干扰。
+  const nums=[];let cut=tokens.length;
+  for(let i=tokens.length-1;i>=1&&nums.length<3;i--){if(/^\d+(?:\.\d+)?$/.test(tokens[i])){nums.unshift(Number(tokens[i]));cut=i;}else if(nums.length)break;}
+  if(nums.length<3)return null;
+  const [workload,rate,amount]=nums;
+  const prefix=tokens.slice(1,cut);if(prefix.length<3)return null;
+  const workTypeIndex=prefix.findIndex(x=>/^(对白|旁白|演播|角色|后期|审听|校对|其他)$/.test(x));
+  if(workTypeIndex<1)return null;
+  const sourceName=prefix[0],bookName=prefix.slice(1,workTypeIndex).join(' '),workType=prefix[workTypeIndex];
+  const range=cleanDateRange(after),settlementDate=cleanDate(dateMatches[dateMatches.length-1]);
+  return {serial,income_source:sourceName,book_name:bookName,work_type:workType,workload_hours:workload,rate,amount,settlement_method:method,settlement_range:range,settlement_date:settlementDate,confidence:'medium',raw_cells:[t]};
+}
+function parseGuaguaLines(lines){
+  const normalized=(Array.isArray(lines)?lines:[]).map((l,i)=>{const rect=l?.rect||{},c=rectCenter(rect);return {i,text:normText(l?.text),prob:Number(l?.prob||0),rect:{x:Number(rect.x||0),y:Number(rect.y||0),width:Number(rect.width||0),height:Number(rect.height||0)},cx:c.x,cy:c.y};}).filter(l=>l.text);
+  if(!normalized.length)return [];
+  const headerTokens=normalized.map(l=>({...l,key:guaguaHeaderKey(l.text)})).filter(l=>l.key);
+  const headerY=headerTokens.length?median(headerTokens.map(x=>x.cy)):-Infinity;
+  const centers={};for(const h of headerTokens){if(!centers[h.key]||h.prob>(centers[h.key].prob||0))centers[h.key]={x:h.rect.x,prob:h.prob};}
+  const orderedKeys=['serial','income_source','book_name','work_type','workload_hours','rate','amount','settlement_method','settlement_range','settlement_date'];
+  const centerPairs=orderedKeys.filter(k=>centers[k]).map(k=>[k,centers[k].x]).sort((a,b)=>a[1]-b[1]);
+  const heights=normalized.map(x=>x.rect.height).filter(x=>x>0),threshold=Math.max(10,Math.min(34,median(heights)*1.25));
+  const dataLines=normalized.filter(l=>l.cy>headerY+threshold*.3 && !guaguaHeaderKey(l.text));
+  const clusters=clusterByRow(dataLines,threshold);
+  const rows=[];
+  for(const row of clusters){
+    if(row.items.length===1){const joined=parseGuaguaJoinedText(row.items[0].text);if(joined){rows.push(joined);continue;}}
+    let cells={};
+    if(centerPairs.length>=6){
+      for(const item of row.items){let best=null;for(const [key,x] of centerPairs){const d=Math.abs(item.rect.x-x);if(!best||d<best.d)best={key,d};}if(best){cells[best.key]=[cells[best.key],item.text].filter(Boolean).join(' ').trim();}}
+    }else{
+      const arr=row.items.map(x=>x.text).filter(Boolean);if(arr.length<5)continue;
+      // 表格默认列序与呱呱账单一致；仅作为找不到表头时的兜底。
+      for(let i=0;i<Math.min(arr.length,orderedKeys.length);i++)cells[orderedKeys[i]]=arr[i];
+    }
+    const rawCells=orderedKeys.map(k=>cells[k]||'');
+    const serial=cleanNumber(cells.serial),workload=cleanNumber(cells.workload_hours),rate=cleanNumber(cells.rate),amount=cleanNumber(cells.amount);
+    const bookName=String(cells.book_name||'').trim(),sourceName=String(cells.income_source||'').trim();
+    if(!bookName && !Number.isFinite(amount))continue;
+    if(Number.isFinite(serial)&&serial>9999)continue;
+    if(!Number.isFinite(rate)&&!Number.isFinite(amount)&&!Number.isFinite(workload))continue;
+    const confidence=bookName&&Number.isFinite(rate)&&Number.isFinite(amount)?'high':bookName&&Number.isFinite(amount)?'medium':'low';
+    rows.push({
+      serial:Number.isFinite(serial)?serial:null,
+      income_source:sourceName,
+      book_name:bookName,
+      work_type:String(cells.work_type||'').trim(),
+      workload_hours:Number.isFinite(workload)?workload:0,
+      rate:Number.isFinite(rate)?rate:0,
+      amount:Number.isFinite(amount)?amount:0,
+      settlement_method:String(cells.settlement_method||'').trim(),
+      settlement_range:cleanDateRange(cells.settlement_range||''),
+      settlement_date:cleanDate(cells.settlement_date||''),
+      confidence,
+      raw_cells:rawCells,
+    });
+  }
+  // 去除同一截图内 OCR 重复行。
+  const seen=new Set();return rows.filter(r=>{const k=[r.serial,r.income_source,r.book_name,r.amount,r.settlement_range,r.settlement_date].join('|');if(seen.has(k))return false;seen.add(k);return true;});
+}
+
 async function callVolcOcr(imageBase64, env) {
   const body = new URLSearchParams({
     image_base64: imageBase64,
@@ -214,7 +297,7 @@ async function callVolcOcr(imageBase64, env) {
   return {raw,lines};
 }
 
-export { parseOcrLines, extractRange, extractDuration, matchKnownAlias, buildVolcHeaders };
+export { parseOcrLines, parseGuaguaLines, parseGuaguaJoinedText, extractRange, extractDuration, matchKnownAlias, buildVolcHeaders };
 
 export default {
   async fetch(request, env) {
@@ -223,7 +306,7 @@ export default {
 
     if (url.pathname === '/health' && request.method === 'GET') {
       const configured=!!(env.VOLC_ACCESS_KEY_ID&&env.VOLC_SECRET_ACCESS_KEY);
-      return json({ok:configured, provider:'火山引擎通用文字识别', model:'OCRNormal', version:'0.6', configured}, configured?200:500, request, env);
+      return json({ok:configured, provider:'火山引擎通用文字识别', model:'OCRNormal', version:'0.9', features:['au','guagua'], configured}, configured?200:500, request, env);
     }
     if (url.pathname !== '/ocr' || request.method !== 'POST') return json({ok:false,error:'Not found'},404,request,env);
     if (!env.VOLC_ACCESS_KEY_ID || !env.VOLC_SECRET_ACCESS_KEY) return json({ok:false,error:'Worker 未配置 VOLC_ACCESS_KEY_ID / VOLC_SECRET_ACCESS_KEY'},500,request,env);
@@ -237,9 +320,13 @@ export default {
 
     try {
       const result=await callVolcOcr(imageBase64,env);
+      if(String(body?.mode||'').toLowerCase()==='guagua'){
+        const statement_rows=parseGuaguaLines(result.lines);
+        return json({ok:true,provider:'火山引擎通用文字识别',model:'OCRNormal',mode:'guagua',statement_rows,raw_line_count:result.lines.length},200,request,env);
+      }
       const records=parseOcrLines(result.lines,body?.books||[]);
       const ignored_count=records.filter(r=>r.ignored).length;
-      return json({ok:true,provider:'火山引擎通用文字识别',model:'OCRNormal',records,ignored_count,raw_line_count:result.lines.length},200,request,env);
+      return json({ok:true,provider:'火山引擎通用文字识别',model:'OCRNormal',mode:'au',records,ignored_count,raw_line_count:result.lines.length},200,request,env);
     } catch (e) {
       return json({ok:false,error:String(e?.message||'火山 OCR 调用失败')},502,request,env);
     }
